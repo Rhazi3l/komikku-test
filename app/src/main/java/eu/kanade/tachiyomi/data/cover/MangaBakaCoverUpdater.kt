@@ -288,6 +288,8 @@ class MangaBakaCoverUpdater(
                 ?: break
             val items = root["data"] as? JsonArray ?: break
             for (item in items.map { it.jsonObject }) {
+                // Front covers only; back covers are "volume_back" (the query asks for these, this makes sure).
+                if (item.str("type") != "volume") continue
                 // Rank by the volume in the label: "3", or "3.1" for an alternate edition of volume 3, which
                 // only counts when volume 3 itself has no cover. index_numeric is not used, as it does not
                 // always follow the label. Labels that are not numbers ("Box set") are skipped.
