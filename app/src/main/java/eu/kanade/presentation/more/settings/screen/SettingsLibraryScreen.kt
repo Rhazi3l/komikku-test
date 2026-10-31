@@ -231,7 +231,7 @@ object SettingsLibraryScreen : SearchableSettings {
                 Preference.PreferenceItem.ListPreference(
                     preference = libraryPreferences.mangaBakaCoverLanguage(),
                     // MangaBaka's language codes, named in the device language. "es-la" is Latin American Spanish.
-                    entries = "ja en ko zh zh-Hant fr de es es-la it pt pt-br ru".split(' ')
+                    entries = "ja en ko zh zh-Hant fr de es es-la it pt pt-br ru pl nl uk he id th".split(' ')
                         .associateWith { Locale.forLanguageTag(it.replace("es-la", "es-419")).displayName }
                         .toImmutableMap(),
                     title = stringResource(KMR.strings.pref_mangabaka_cover_language),
