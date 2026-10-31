@@ -27,6 +27,7 @@ import eu.kanade.tachiyomi.data.LibraryUpdateStatus
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.data.sync.SyncDataJob
+import eu.kanade.tachiyomi.data.cover.MangaBakaCoverUpdater
 import eu.kanade.tachiyomi.data.track.TrackStatus
 import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.source.model.SManga
@@ -124,6 +125,9 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
     private val getTracks: GetTracks = Injekt.get()
     private val insertTrack: InsertTrack = Injekt.get()
     private val trackerManager: TrackerManager = Injekt.get()
+    // KMK -->
+    private val mangaBakaCoverUpdater = MangaBakaCoverUpdater()
+    // KMK <--
     private val mdList = trackerManager.mdList
     // SY <--
 
@@ -447,6 +451,10 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                                     try {
                                         val newChapters = updateManga(manga, fetchWindow)
                                             .sortedByDescending { it.sourceOrder }
+
+                                        // KMK -->
+                                        mangaBakaCoverUpdater.update(manga)
+                                        // KMK <--
 
                                         if (newChapters.isNotEmpty()) {
                                             val chaptersToDownload = filterChaptersForDownload.await(manga, newChapters)

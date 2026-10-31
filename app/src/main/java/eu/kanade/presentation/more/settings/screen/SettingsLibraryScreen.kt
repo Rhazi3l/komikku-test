@@ -214,6 +214,13 @@ object SettingsLibraryScreen : SearchableSettings {
                     title = stringResource(MR.strings.pref_library_update_refresh_metadata),
                     subtitle = stringResource(MR.strings.pref_library_update_refresh_metadata_summary),
                 ),
+                // KMK -->
+                Preference.PreferenceItem.SwitchPreference(
+                    preference = libraryPreferences.mangaBakaCovers(),
+                    title = stringResource(KMR.strings.pref_mangabaka_covers),
+                    subtitle = stringResource(KMR.strings.pref_mangabaka_covers_summary),
+                ),
+                // KMK <--
                 Preference.PreferenceItem.MultiSelectListPreference(
                     preference = libraryPreferences.autoUpdateMangaRestrictions(),
                     entries = persistentMapOf(

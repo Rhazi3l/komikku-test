@@ -238,4 +238,6 @@
     <string name="pref_discord_show_download_button_summary">Displays a button to download the app</string>
     <string name="pref_discord_show_discord_button">Show Discord Button</string>
     <string name="pref_discord_show_discord_button_summary">Displays a button to join the Discord server</string>
+    <string name="pref_mangabaka_covers">Use MangaBaka covers</string>
+    <string name="pref_mangabaka_covers_summary">Replace library covers with the latest original (Japanese) volume cover from MangaBaka, for titles tracked on AniList. Covers you set yourself are kept. Cover data courtesy of MangaBaka (CC BY-NC-SA 4.0).</string>
 </resources>
