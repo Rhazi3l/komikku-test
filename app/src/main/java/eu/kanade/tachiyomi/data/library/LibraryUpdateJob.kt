@@ -191,7 +191,10 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                     Target.CHAPTERS -> {
                         updateChapterList()
                         // KMK -->
-                        mangaBakaCoverUpdater.updateAll(mangaForCovers)
+                        mangaBakaCoverUpdater.updateAll(mangaForCovers) { manga, done, total ->
+                            notifier.showProgressNotification(listOf(manga), done, total)
+                        }
+                        notifier.cancelProgressNotification()
                         // KMK <--
                     }
                     // SY -->

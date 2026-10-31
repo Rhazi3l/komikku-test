@@ -599,7 +599,12 @@ class MangaScreenModel(
             launch { syncTrackers() }
             // A refresh the user asked for also re-checks the MangaBaka cover, ignoring the 7-day wait.
             if (manualFetch) {
-                successState?.manga?.let { launch { mangaBakaCoverUpdater.update(it, force = true) } }
+                successState?.manga?.let { manga ->
+                    launch {
+                        val message = mangaBakaMessage(mangaBakaCoverUpdater.update(manga, force = true))
+                        if (message != null) snackbarHostState.showSnackbar(message = message)
+                    }
+                }
             }
             // KMK <--
             updateSuccessState { it.copy(isRefreshingData = false) }
@@ -651,6 +656,17 @@ class MangaScreenModel(
     }
 
     // KMK -->
+    private fun mangaBakaMessage(outcome: MangaBakaCoverUpdater.Outcome): String? = when (outcome) {
+        is MangaBakaCoverUpdater.Outcome.Updated ->
+            context.stringResource(KMR.strings.mangabaka_cover_updated, outcome.volume)
+        MangaBakaCoverUpdater.Outcome.Unchanged -> context.stringResource(KMR.strings.mangabaka_cover_unchanged)
+        MangaBakaCoverUpdater.Outcome.NoCovers -> context.stringResource(KMR.strings.mangabaka_cover_none)
+        MangaBakaCoverUpdater.Outcome.NotTracked -> context.stringResource(KMR.strings.mangabaka_cover_not_tracked)
+        MangaBakaCoverUpdater.Outcome.UserCover -> context.stringResource(KMR.strings.mangabaka_cover_user)
+        MangaBakaCoverUpdater.Outcome.Failed -> context.stringResource(KMR.strings.mangabaka_cover_failed)
+        MangaBakaCoverUpdater.Outcome.CheckedRecently, MangaBakaCoverUpdater.Outcome.Skipped -> null
+    }
+
     private suspend fun clearErrorFromDB(mangaId: Long) {
         deleteLibraryUpdateErrors.deleteMangaError(mangaIds = listOf(mangaId))
     }

@@ -22,6 +22,7 @@ import kotlinx.serialization.json.jsonObject
 import logcat.LogPriority
 import okhttp3.Request
 import okhttp3.Response
+import tachiyomi.core.common.util.lang.withIOContext
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.model.Manga
@@ -54,38 +55,64 @@ class MangaBakaCoverUpdater(
      * Updates covers for the whole list, one title at a time to stay inside MangaBaka's rate limit.
      * Runs independently of the chapter-update restrictions (completed, unread, release window).
      * With [force] the 7-day wait between checks is ignored, for refreshes the user asked for.
+     * [onProgress] is called at most every [PROGRESS_INTERVAL_MS] with the title being checked.
      */
-    suspend fun updateAll(mangaList: List<Manga>, force: Boolean = false) {
+    suspend fun updateAll(
+        mangaList: List<Manga>,
+        force: Boolean = false,
+        onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit = { _, _, _ -> },
+    ) {
         if (!libraryPreferences.mangaBakaCovers().get()) return
-        for (manga in mangaList) {
+        var lastProgress = 0L
+        mangaList.forEachIndexed { done, manga ->
             currentCoroutineContext().ensureActive()
+            if (now() - lastProgress >= PROGRESS_INTERVAL_MS) {
+                lastProgress = now()
+                onProgress(manga, done, mangaList.size)
+            }
             update(manga, force)
         }
     }
 
     /** Never throws (except cancellation); any failure leaves the current cover untouched. */
-    suspend fun update(manga: Manga, force: Boolean = false) {
-        if (!libraryPreferences.mangaBakaCovers().get() || manga.isLocal() || !manga.favorite) return
-        try {
-            updateInternal(manga, force)
+    suspend fun update(manga: Manga, force: Boolean = false): Outcome {
+        if (!libraryPreferences.mangaBakaCovers().get() || manga.isLocal() || !manga.favorite) return Outcome.Skipped
+        return try {
+            // File and network work, so never on the caller's (possibly main) thread.
+            withIOContext { updateInternal(manga, force) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             logcat(LogPriority.WARN, e) { "MangaBaka cover update failed for '${manga.title}'" }
+            Outcome.Failed
         }
     }
 
-    private suspend fun updateInternal(manga: Manga, force: Boolean) {
+    /** What [update] did with a title, for feedback to the user. */
+    sealed interface Outcome {
+        data class Updated(val volume: String) : Outcome
+        data object Unchanged : Outcome
+        data object NoCovers : Outcome
+        data object NotTracked : Outcome
+        data object UserCover : Outcome
+        data object CheckedRecently : Outcome
+        data object Failed : Outcome
+        data object Skipped : Outcome
+    }
+
+    private suspend fun updateInternal(manga: Manga, force: Boolean): Outcome {
         val language = libraryPreferences.mangaBakaCoverLanguage().get()
         val coverFile = coverCache.getCustomCoverFile(manga.id)
         val markerFile = File(coverFile.parentFile, coverFile.name + ".mb")
         val marker = readMarker(markerFile)
 
         // A custom cover we did not write (or that was changed since) belongs to the user.
-        if (coverFile.exists() && (marker == null || marker.coverModified != coverFile.lastModified())) return
+        if (coverFile.exists() && (marker == null || marker.coverModified != coverFile.lastModified())) {
+            return Outcome.UserCover
+        }
         // Checked recently in this language (also covers titles MangaBaka has nothing for).
         val lastCheck = marker?.takeIf { it.checkedLanguage == language }?.checkedAt
-        if (!force && lastCheck != null && now() - lastCheck < RECHECK_MS) return
+        if (!force && lastCheck != null && now() - lastCheck < RECHECK_MS) return Outcome.CheckedRecently
 
         val tracks = getTracks.await(manga.id)
         val candidates = SOURCES.mapNotNull { (trackerId, source) ->
@@ -95,7 +122,7 @@ class MangaBakaCoverUpdater(
             val id = if (trackerId == TrackerManager.MANGA_UPDATES) remoteId.toString(36) else remoteId.toString()
             source to id
         }
-        if (candidates.isEmpty()) return
+        if (candidates.isEmpty()) return Outcome.NotTracked
 
         // Try each linked tracker in order until MangaBaka knows the series.
         val seriesId = candidates.firstNotNullOfOrNull { (source, id) -> resolveSeriesId(source, id) }
@@ -106,21 +133,22 @@ class MangaBakaCoverUpdater(
             val checked = now()
             val kept = if (coverFile.exists()) marker?.copy(checkedAt = checked, checkedLanguage = language) else null
             writeMarker(markerFile, kept ?: Marker(0, "", checked, 0, language, language))
-            return
+            return Outcome.NoCovers
         }
         val (index, imageUrl) = latest
 
         // The cover on disk is already this volume in this language.
         if (coverFile.exists() && marker != null && marker.isCover(seriesId, index, language)) {
             writeMarker(markerFile, marker.copy(checkedAt = now(), checkedLanguage = language))
-            return
+            return Outcome.Unchanged
         }
 
         val bytes = get(imageUrl).use { it.body.bytes() }
-        if (bytes.isEmpty()) return
+        if (bytes.isEmpty()) return Outcome.Failed
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
         writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, language))
         updateManga.awaitUpdateCoverLastModified(manga.id)
+        return Outcome.Updated(index)
     }
 
     private suspend fun resolveSeriesId(source: String, id: String): Long? {
@@ -214,7 +242,9 @@ class MangaBakaCoverUpdater(
         val parts = file.readText().trim().split('|')
         val language = parts.getOrNull(4) ?: "ja" // markers from before the language option are Japanese
         val checkedLanguage = parts.getOrNull(5) ?: language
-        Marker(parts[0].toLong(), parts[1], parts[2].toLong(), parts[3].toLong(), language, checkedLanguage)
+        // Markers from builds before the volume-label fix may point at the wrong volume: check those again.
+        val checkedAt = if (parts.size >= 6) parts[2].toLong() else 0L
+        Marker(parts[0].toLong(), parts[1], checkedAt, parts[3].toLong(), language, checkedLanguage)
     }.getOrNull()
 
     private fun writeMarker(file: File, m: Marker) {
@@ -237,6 +267,7 @@ class MangaBakaCoverUpdater(
         const val HTTP_TOO_MANY_REQUESTS = 429
         const val RETRY_AFTER_MS = 10_000L
         const val REQUEST_SPACING_MS = 350L
+        const val PROGRESS_INTERVAL_MS = 500L
     }
 }
 // KMK <--

@@ -63,7 +63,9 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
                 updateMetadata()
                 // KMK -->
                 // "Refresh library covers" includes MangaBaka covers, ignoring the usual 7-day wait.
-                mangaBakaCoverUpdater.updateAll(mangaToUpdate.map { it.manga }, force = true)
+                mangaBakaCoverUpdater.updateAll(mangaToUpdate.map { it.manga }, force = true) { manga, done, total ->
+                    notifier.showProgressNotification(listOf(manga), done, total)
+                }
                 // KMK <--
                 Result.success()
             } catch (e: Exception) {
