@@ -229,8 +229,12 @@ class MangaBakaCoverUpdater(
         val candidates = sources.mapNotNull { (trackerId, source) ->
             val remoteId = tracks.firstOrNull { it.trackerId == trackerId }?.remoteId?.takeIf { it > 0 }
                 ?: return@mapNotNull null
-            // MangaBaka identifies MangaUpdates series by the base-36 form of the numeric ID.
-            val id = if (trackerId == trackerManager.mangaUpdates.id) remoteId.toString(36) else remoteId.toString()
+            // MangaBaka identifies MangaUpdates series by the 7-character base-36 form of the numeric ID.
+            val id = if (trackerId == trackerManager.mangaUpdates.id) {
+                remoteId.toString(36).padStart(7, '0')
+            } else {
+                remoteId.toString()
+            }
             source to id
         }
         if (candidates.isEmpty()) return Outcome.NotTracked
