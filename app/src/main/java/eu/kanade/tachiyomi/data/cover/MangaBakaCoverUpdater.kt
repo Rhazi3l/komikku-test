@@ -291,12 +291,13 @@ class MangaBakaCoverUpdater(
         return Outcome.Updated(index)
     }
 
-    /** The active MangaBaka series for a tracker link ("anilist/30642"), skipping light novels. */
+    /**
+     * The active MangaBaka series for a tracker link ("anilist/30642"). The tracked entry decides the work,
+     * so a light novel tracked as such gets the novel's covers.
+     */
     private suspend fun resolveSeriesId(link: String): Long? {
         val root = getJson("$API/v1/source/$link") ?: return null
-        val series = root["data"]?.jsonObject?.get("series")?.jsonArray?.map { it.jsonObject }
-            ?.filter { it.str("type") != "novel" }
-            ?: return null
+        val series = root["data"]?.jsonObject?.get("series")?.jsonArray?.map { it.jsonObject } ?: return null
         val active = series.firstOrNull { it.str("state") == "active" }
         if (active != null) return active.long("id")
         // Follow a merge once.
