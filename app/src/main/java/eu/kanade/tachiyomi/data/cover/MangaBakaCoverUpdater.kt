@@ -168,7 +168,7 @@ class MangaBakaCoverUpdater(
             val coverFile = coverCache.getCustomCoverFile(manga.id)
             val markerFile = File(coverFile.parentFile, coverFile.name + ".mb")
             val marker = readMarker(markerFile) ?: return@forEachIndexed
-            if (coverFile.exists() && marker.owns(coverFile)) {
+            if (coverFile.exists() && marker.owns(coverFile.lastModified())) {
                 coverCache.deleteCustomCover(manga.id)
                 updateManga.awaitUpdateCoverLastModified(manga.id)
                 restored++
@@ -230,7 +230,7 @@ class MangaBakaCoverUpdater(
         val marker = readMarker(markerFile)
 
         // A custom cover we did not write (or that was changed since) belongs to the user.
-        if (coverFile.exists() && marker?.owns(coverFile) != true) return Outcome.UserCover
+        if (coverFile.exists() && marker?.owns(coverFile.lastModified()) != true) return Outcome.UserCover
         // Checked recently in this language (also covers titles MangaBaka has nothing for).
         val recheck = if (manga.status == SManga.COMPLETED.toLong()) RECHECK_COMPLETED_MS else RECHECK_MS
         val lastCheck = marker?.takeIf { it.language == language }?.checkedAt
@@ -242,7 +242,7 @@ class MangaBakaCoverUpdater(
                 ?: return@mapNotNull null
             // MangaBaka identifies MangaUpdates series by the 7-character base-36 form of the numeric ID.
             val id = if (trackerId == trackerManager.mangaUpdates.id) {
-                remoteId.toString(36).padStart(7, '0')
+                MangaBakaRules.mangaUpdatesId(remoteId)
             } else {
                 remoteId.toString()
             }
@@ -266,7 +266,7 @@ class MangaBakaCoverUpdater(
                 coverCache.deleteCustomCover(manga.id)
                 updateManga.awaitUpdateCoverLastModified(manga.id)
             }
-            writeMarker(markerFile, Marker(0, "", now(), 0, language, ""))
+            writeMarker(markerFile, MangaBakaMarker(0, "", now(), 0, language, ""))
             return Outcome.NoCovers
         }
         val (seriesId, link) = series
@@ -284,9 +284,10 @@ class MangaBakaCoverUpdater(
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         if (bounds.outWidth <= 0) return Outcome.Failed("not an image")
         // Claim the cover first, so a write cut short is not mistaken for the user's own cover later.
-        writeMarker(markerFile, Marker(seriesId, index, 0, WRITING, language, link))
+        writeMarker(markerFile, MangaBakaMarker(seriesId, index, 0, MangaBakaMarker.WRITING, language, link))
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
-        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, link))
+        val written = MangaBakaMarker(seriesId, index, now(), coverFile.lastModified(), language, link)
+        writeMarker(markerFile, written)
         updateManga.awaitUpdateCoverLastModified(manga.id)
         return Outcome.Updated(index)
     }
@@ -306,37 +307,20 @@ class MangaBakaCoverUpdater(
         return merged["data"]?.jsonObject?.long("id") ?: mergedWith
     }
 
-    /** Latest volume with a cover in [language], as (volume label, image URL). */
-    private suspend fun latestVolumeCover(seriesId: Long, language: String): Pair<String, String>? {
-        var best: Triple<Double, String, String>? = null
+    /** Latest front volume cover in [language], across all pages of the series' covers. */
+    private suspend fun latestVolumeCover(seriesId: Long, language: String): VolumeCover? {
+        var best: VolumeCover? = null
         var page = 1
         while (page <= MAX_PAGES) {
             val root = getJson("$API/v1/series/$seriesId/images?type=volume&language=$language&limit=50&page=$page")
                 ?: break
-            val items = root["data"] as? JsonArray ?: break
-            for (item in items.map { it.jsonObject }) {
-                // Front covers in this language only (the query asks for these; this makes sure).
-                // Back covers are "volume_back".
-                if (item.str("type") != "volume" || !item.str("language").equals(language, ignoreCase = true)) continue
-                // Rank by the volume in the label: "3", or "3.1" for an alternate edition of volume 3, which
-                // only counts when volume 3 itself has no cover. index_numeric is not used, as it does not
-                // always follow the label. Labels that are not numbers ("Box set") are skipped.
-                val label = item.str("index")?.takeIf { VOLUME_LABEL.matches(it) } ?: continue
-                val number = label.toDouble()
-                val rank = floor(number) * 2 + if (number == floor(number)) 1 else 0
-                val image = item["image"]?.jsonObject ?: continue
-                val url = image["x350"]?.jsonObject?.str("x2")
-                    ?: image["raw"]?.jsonObject?.str("url")
-                    ?: continue
-                if (best == null || rank > best.first) {
-                    best = Triple(rank, label, url)
-                }
-            }
+            val items = (root["data"] as? JsonArray)?.map { it.jsonObject } ?: break
+            best = listOfNotNull(best, MangaBakaRules.latestFrontCover(items, language)).maxByOrNull { it.rank }
             val next = root["pagination"]?.jsonObject?.get("next")
             if (next == null || next is JsonNull) break
             page++
         }
-        return best?.let { it.second to it.third }
+        return best
     }
 
     /** Null means "not found" (HTTP 404). Any other failure throws, so it is not remembered as a miss. */
@@ -380,51 +364,21 @@ class MangaBakaCoverUpdater(
     /** 10 s, 20 s, 40 s, 80 s. */
     private fun backoff(attempt: Int) = RETRY_MIN_MS shl (attempt - 1)
 
-    private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
-    private fun JsonObject.long(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
-
     private fun now() = System.currentTimeMillis()
 
-    /**
-     * What this class last wrote for a title, in [language], found through tracker [link].
-     * A miss (no covers) is stored with seriesId 0; a cover being written has coverModified [WRITING].
-     */
-    private data class Marker(
-        val seriesId: Long,
-        val index: String,
-        val checkedAt: Long,
-        val coverModified: Long,
-        val language: String,
-        val link: String,
-    ) {
-        fun isCover(seriesId: Long, index: String, language: String) = coverModified != WRITING &&
-            this.seriesId == seriesId && this.index == index && this.language == language
+    private fun readMarker(file: File): MangaBakaMarker? =
+        runCatching { MangaBakaMarker.parse(file.readText()) }.getOrNull()
 
-        /** The cover file is the one this class wrote (or was writing when interrupted). */
-        fun owns(coverFile: File) = coverModified == WRITING || coverModified == coverFile.lastModified()
-    }
-
-    private fun readMarker(file: File): Marker? = runCatching {
-        val parts = file.readText().trim().split('|')
-        val (seriesId, index, checkedAt, coverModified, language) = parts
-        val link = parts.getOrElse(5) { "" }
-        Marker(seriesId.toLong(), index, checkedAt.toLong(), coverModified.toLong(), language, link)
-    }.getOrNull()
-
-    private fun writeMarker(file: File, m: Marker) {
-        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}|${m.link}")
-    }
+    private fun writeMarker(file: File, marker: MangaBakaMarker) = file.writeText(marker.serialize())
 
     private companion object {
         /** One pass at a time: a library update, the refresh button or a language change. */
         val passLock = Mutex()
 
         const val API = "https://api.mangabaka.org"
-        val VOLUME_LABEL = Regex("""\d+(\.\d+)?""")
 
         const val RECHECK_MS = 24L * 60 * 60 * 1000
         const val RECHECK_COMPLETED_MS = 7 * RECHECK_MS
-        const val WRITING = -1L
         const val MAX_PAGES = 20
         const val HTTP_NOT_FOUND = 404
         const val HTTP_TOO_MANY_REQUESTS = 429
@@ -437,4 +391,82 @@ class MangaBakaCoverUpdater(
         const val NOTIFICATION_ID = -110
     }
 }
+
+/** The pure rules behind [MangaBakaCoverUpdater], kept apart so they can be unit tested. */
+internal object MangaBakaRules {
+    private val VOLUME_LABEL = Regex("""\d+(\.\d+)?""")
+
+    /**
+     * Rank of a volume label: "3" for volume 3, or "3.1" for an alternate edition of volume 3, which only wins
+     * when volume 3 itself has no cover. Labels that are not numbers ("Box set", "1-3") have no rank.
+     * index_numeric is not used, as it does not always follow the label.
+     */
+    fun volumeRank(label: String): Double? {
+        if (!VOLUME_LABEL.matches(label)) return null
+        val number = label.toDouble()
+        return floor(number) * 2 + if (number == floor(number)) 1 else 0
+    }
+
+    /** MangaBaka identifies MangaUpdates series by the 7-character base-36 form of the numeric ID. */
+    fun mangaUpdatesId(remoteId: Long) = remoteId.toString(36).padStart(7, '0')
+
+    /** Latest front cover in [language] among [items] (one page of MangaBaka's images API). */
+    fun latestFrontCover(items: List<JsonObject>, language: String): VolumeCover? = items.mapNotNull { item ->
+        // Front covers in this language only (the query asks for these; this makes sure).
+        // Back covers are "volume_back".
+        if (item.str("type") != "volume" || !item.str("language").equals(language, ignoreCase = true)) {
+            return@mapNotNull null
+        }
+        val label = item.str("index") ?: return@mapNotNull null
+        val rank = volumeRank(label) ?: return@mapNotNull null
+        val image = item["image"]?.jsonObject ?: return@mapNotNull null
+        val url = image["x350"]?.jsonObject?.str("x2") ?: image["raw"]?.jsonObject?.str("url")
+        url?.let { VolumeCover(label, it, rank) }
+    }.maxByOrNull { it.rank }
+}
+
+internal data class VolumeCover(val label: String, val url: String, val rank: Double)
+
+/**
+ * What [MangaBakaCoverUpdater] last did for a title, kept in a small file next to the cover: the cover
+ * is volume [index] of series [seriesId] in [language], found through tracker [link] ("anilist/30642").
+ * A miss (no covers) has seriesId 0; a cover being written has coverModified [WRITING].
+ */
+internal data class MangaBakaMarker(
+    val seriesId: Long,
+    val index: String,
+    val checkedAt: Long,
+    val coverModified: Long,
+    val language: String,
+    val link: String,
+) {
+    fun isCover(seriesId: Long, index: String, language: String) = coverModified != WRITING &&
+        this.seriesId == seriesId && this.index == index && this.language == language
+
+    /** The cover on disk (last modified at [coverModified]) is the one written (or being written) here. */
+    fun owns(coverModified: Long) = this.coverModified == WRITING || this.coverModified == coverModified
+
+    fun serialize() = "$seriesId|$index|$checkedAt|$coverModified|$language|$link"
+
+    companion object {
+        const val WRITING = -1L
+
+        fun parse(text: String): MangaBakaMarker {
+            val parts = text.trim().split('|')
+            val (seriesId, index, checkedAt, coverModified, language) = parts
+            val link = parts.getOrElse(5) { "" }
+            return MangaBakaMarker(
+                seriesId = seriesId.toLong(),
+                index = index,
+                checkedAt = checkedAt.toLong(),
+                coverModified = coverModified.toLong(),
+                language = language,
+                link = link,
+            )
+        }
+    }
+}
+
+private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
+private fun JsonObject.long(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
 // KMK <--

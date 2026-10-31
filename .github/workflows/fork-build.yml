@@ -23,6 +23,9 @@ jobs:
       - name: Check formatting (spotless, as upstream CI does)
         run: ./gradlew spotlessCheck
 
+      - name: Unit tests for the MangaBaka covers
+        run: ./gradlew :app:testReleaseUnitTest --tests 'eu.kanade.tachiyomi.data.cover.*'
+
       - name: Build release APK (no telemetry, no updater)
         run: ./gradlew assembleRelease
 
