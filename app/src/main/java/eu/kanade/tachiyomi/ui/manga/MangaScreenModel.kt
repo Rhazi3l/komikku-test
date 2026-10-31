@@ -49,6 +49,7 @@ import eu.kanade.presentation.manga.DownloadAction
 import eu.kanade.presentation.manga.components.ChapterDownloadAction
 import eu.kanade.presentation.util.formattedMessage
 import eu.kanade.tachiyomi.data.coil.getBestColor
+import eu.kanade.tachiyomi.data.cover.MangaBakaCoverUpdater
 import eu.kanade.tachiyomi.data.download.DownloadCache
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.DownloadProvider
@@ -240,6 +241,7 @@ class MangaScreenModel(
     // KMK -->
     val useNewSourceNavigation by uiPreferences.useNewSourceNavigation().asState(screenModelScope)
     val themeCoverBased = uiPreferences.themeCoverBased().get()
+    private val mangaBakaCoverUpdater = MangaBakaCoverUpdater()
     // KMK <--
 
     val manga: Manga?
@@ -595,6 +597,10 @@ class MangaScreenModel(
             )
             // KMK -->
             launch { syncTrackers() }
+            // A refresh the user asked for also re-checks the MangaBaka cover, ignoring the 7-day wait.
+            if (manualFetch) {
+                successState?.manga?.let { launch { mangaBakaCoverUpdater.update(it, force = true) } }
+            }
             // KMK <--
             updateSuccessState { it.copy(isRefreshingData = false) }
         }

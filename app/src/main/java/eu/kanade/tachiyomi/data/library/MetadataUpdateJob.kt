@@ -10,6 +10,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkQuery
 import androidx.work.WorkerParameters
+import eu.kanade.tachiyomi.data.cover.MangaBakaCoverUpdater
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.util.system.isRunning
 import eu.kanade.tachiyomi.util.system.setForegroundSafely
@@ -44,6 +45,10 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
     private val getLibraryManga: GetLibraryManga = Injekt.get()
     private val updateMangaFromRemote: UpdateMangaFromRemote = Injekt.get()
 
+    // KMK -->
+    private val mangaBakaCoverUpdater = MangaBakaCoverUpdater()
+    // KMK <--
+
     private val notifier = LibraryUpdateNotifier(context)
 
     private var mangaToUpdate: List<LibraryManga> = mutableListOf()
@@ -56,6 +61,10 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
         return withIOContext {
             try {
                 updateMetadata()
+                // KMK -->
+                // "Refresh library covers" includes MangaBaka covers, ignoring the usual 7-day wait.
+                mangaBakaCoverUpdater.updateAll(mangaToUpdate.map { it.manga }, force = true)
+                // KMK <--
                 Result.success()
             } catch (e: Exception) {
                 if (e is CancellationException) {

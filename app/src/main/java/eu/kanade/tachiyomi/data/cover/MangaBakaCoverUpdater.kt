@@ -4,19 +4,21 @@ package eu.kanade.tachiyomi.data.cover
 import eu.kanade.domain.manga.interactor.UpdateManga
 import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.data.track.TrackerManager
-import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.HttpException
+import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.await
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import logcat.LogPriority
 import okhttp3.Request
 import okhttp3.Response
@@ -48,11 +50,24 @@ class MangaBakaCoverUpdater(
     private val client get() = networkHelper.client
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Updates covers for the whole list, one title at a time to stay inside MangaBaka's rate limit.
+     * Runs independently of the chapter-update restrictions (completed, unread, release window).
+     * With [force] the 7-day wait between checks is ignored, for refreshes the user asked for.
+     */
+    suspend fun updateAll(mangaList: List<Manga>, force: Boolean = false) {
+        if (!libraryPreferences.mangaBakaCovers().get()) return
+        for (manga in mangaList) {
+            currentCoroutineContext().ensureActive()
+            update(manga, force)
+        }
+    }
+
     /** Never throws (except cancellation); any failure leaves the current cover untouched. */
-    suspend fun update(manga: Manga) {
+    suspend fun update(manga: Manga, force: Boolean = false) {
         if (!libraryPreferences.mangaBakaCovers().get() || manga.isLocal() || !manga.favorite) return
         try {
-            updateInternal(manga)
+            updateInternal(manga, force)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -60,7 +75,7 @@ class MangaBakaCoverUpdater(
         }
     }
 
-    private suspend fun updateInternal(manga: Manga) {
+    private suspend fun updateInternal(manga: Manga, force: Boolean) {
         val language = libraryPreferences.mangaBakaCoverLanguage().get()
         val coverFile = coverCache.getCustomCoverFile(manga.id)
         val markerFile = File(coverFile.parentFile, coverFile.name + ".mb")
@@ -69,9 +84,8 @@ class MangaBakaCoverUpdater(
         // A custom cover we did not write (or that was changed since) belongs to the user.
         if (coverFile.exists() && (marker == null || marker.coverModified != coverFile.lastModified())) return
         // Checked recently in this language (also covers titles MangaBaka has nothing for).
-        if (marker != null && marker.language == language && System.currentTimeMillis() - marker.checkedAt < RECHECK_MS) {
-            return
-        }
+        val lastCheck = marker?.takeIf { it.checkedLanguage == language }?.checkedAt
+        if (!force && lastCheck != null && now() - lastCheck < RECHECK_MS) return
 
         val tracks = getTracks.await(manga.id)
         val candidates = SOURCES.mapNotNull { (trackerId, source) ->
@@ -87,24 +101,25 @@ class MangaBakaCoverUpdater(
         val seriesId = candidates.firstNotNullOfOrNull { (source, id) -> resolveSeriesId(source, id) }
         val latest = seriesId?.let { latestVolumeCover(it, language) }
         if (seriesId == null || latest == null) {
-            // Remember "nothing found" so uncached 404s are not repeated on every update.
-            if (!coverFile.exists()) writeMarker(markerFile, Marker(0, "", System.currentTimeMillis(), 0, language))
+            // Remember "nothing found" so it is not looked up on every update. A cover we wrote earlier
+            // (for example in another language) stays as it is.
+            val checked = now()
+            val kept = if (coverFile.exists()) marker?.copy(checkedAt = checked, checkedLanguage = language) else null
+            writeMarker(markerFile, kept ?: Marker(0, "", checked, 0, language, language))
             return
         }
         val (index, imageUrl) = latest
 
-        if (coverFile.exists() && marker?.seriesId == seriesId && marker.index == index && marker.language == language) {
-            writeMarker(markerFile, marker.copy(checkedAt = System.currentTimeMillis()))
+        // The cover on disk is already this volume in this language.
+        if (coverFile.exists() && marker != null && marker.isCover(seriesId, index, language)) {
+            writeMarker(markerFile, marker.copy(checkedAt = now(), checkedLanguage = language))
             return
         }
 
         val bytes = get(imageUrl).use { it.body.bytes() }
         if (bytes.isEmpty()) return
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
-        writeMarker(
-            markerFile,
-            Marker(seriesId, index, System.currentTimeMillis(), coverFile.lastModified(), language),
-        )
+        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, language))
         updateManga.awaitUpdateCoverLastModified(manga.id)
     }
 
@@ -139,7 +154,7 @@ class MangaBakaCoverUpdater(
                 }
             }
             val next = root["pagination"]?.jsonObject?.get("next")
-            if (next == null || next is kotlinx.serialization.json.JsonNull) break
+            if (next == null || next is JsonNull) break
             page++
         }
         return best?.let { it.second to it.third }
@@ -154,8 +169,12 @@ class MangaBakaCoverUpdater(
         }
     }
 
-    /** GET with one retry after the server's 10 s back-off on HTTP 429. Throws [HttpException] otherwise. */
+    /**
+     * GET, spaced so a whole-library pass stays under the API's 180 requests per minute, with one retry
+     * after the server's 10 s back-off on HTTP 429. Throws [HttpException] on any other failure.
+     */
     private suspend fun get(url: String): Response {
+        delay(REQUEST_SPACING_MS)
         var response = client.newCall(Request.Builder().url(url).build()).await()
         if (response.code == HTTP_TOO_MANY_REQUESTS) {
             response.close()
@@ -172,21 +191,34 @@ class MangaBakaCoverUpdater(
     private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
     private fun JsonObject.long(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
 
+    private fun now() = System.currentTimeMillis()
+
+    /**
+     * What this class last did for a title. [language] is the language of the cover on disk,
+     * [checkedLanguage] the language last looked up (they differ when that language had no covers).
+     * A miss is stored with seriesId 0.
+     */
     private data class Marker(
         val seriesId: Long,
         val index: String,
         val checkedAt: Long,
         val coverModified: Long,
         val language: String,
-    )
+        val checkedLanguage: String,
+    ) {
+        fun isCover(seriesId: Long, index: String, language: String) =
+            this.seriesId == seriesId && this.index == index && this.language == language
+    }
 
     private fun readMarker(file: File): Marker? = runCatching {
-        val parts = file.readText().split('|')
-        Marker(parts[0].toLong(), parts[1], parts[2].toLong(), parts[3].toLong(), parts.getOrNull(4) ?: "ja")
+        val parts = file.readText().trim().split('|')
+        val language = parts.getOrNull(4) ?: "ja" // markers from before the language option are Japanese
+        val checkedLanguage = parts.getOrNull(5) ?: language
+        Marker(parts[0].toLong(), parts[1], parts[2].toLong(), parts[3].toLong(), language, checkedLanguage)
     }.getOrNull()
 
-    private fun writeMarker(file: File, marker: Marker) {
-        file.writeText("${marker.seriesId}|${marker.index}|${marker.checkedAt}|${marker.coverModified}|${marker.language}")
+    private fun writeMarker(file: File, m: Marker) {
+        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}|${m.checkedLanguage}")
     }
 
     private companion object {
@@ -204,6 +236,7 @@ class MangaBakaCoverUpdater(
         const val HTTP_NOT_FOUND = 404
         const val HTTP_TOO_MANY_REQUESTS = 429
         const val RETRY_AFTER_MS = 10_000L
+        const val REQUEST_SPACING_MS = 350L
     }
 }
 // KMK <--

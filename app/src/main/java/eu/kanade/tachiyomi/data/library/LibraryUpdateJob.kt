@@ -142,6 +142,11 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
 
     private var mangaToUpdate: List<LibraryManga> = mutableListOf()
 
+    // KMK -->
+    /** Every title in scope of this update, before the update restrictions (completed, unread, ...) are applied. */
+    private var mangaForCovers: List<Manga> = emptyList()
+    // KMK <--
+
     override suspend fun doWork(): Result {
         if (tags.contains(WORK_NAME_AUTO)) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
@@ -183,7 +188,12 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
         return withIOContext {
             try {
                 when (target) {
-                    Target.CHAPTERS -> updateChapterList()
+                    Target.CHAPTERS -> {
+                        updateChapterList()
+                        // KMK -->
+                        mangaBakaCoverUpdater.updateAll(mangaForCovers)
+                        // KMK <--
+                    }
                     // SY -->
                     Target.SYNC_FOLLOWS -> syncFollows()
                     Target.PUSH_FAVORITES -> pushFavorites()
@@ -246,6 +256,7 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                             else -> true
                         }
                 }
+            mangaForCovers = libraryManga.filter { it.manga.id in targetMangaIds }.map { it.manga }
 
             notifier.showQueueSizeWarningNotificationIfNeeded(mangaToUpdate)
             return
@@ -306,6 +317,10 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
             }
             // SY <--
         }
+
+        // KMK -->
+        mangaForCovers = listToUpdate.map { it.manga }.distinctBy { it.id }
+        // KMK <--
 
         val restrictions = libraryPreferences.autoUpdateMangaRestrictions().get()
         val skippedUpdates = mutableListOf<Pair<Manga, String?>>()
@@ -451,10 +466,6 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                                     try {
                                         val newChapters = updateManga(manga, fetchWindow)
                                             .sortedByDescending { it.sourceOrder }
-
-                                        // KMK -->
-                                        mangaBakaCoverUpdater.update(manga)
-                                        // KMK <--
 
                                         if (newChapters.isNotEmpty()) {
                                             val chaptersToDownload = filterChaptersForDownload.await(manga, newChapters)
