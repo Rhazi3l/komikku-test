@@ -220,6 +220,21 @@ object SettingsLibraryScreen : SearchableSettings {
                     title = stringResource(KMR.strings.pref_mangabaka_covers),
                     subtitle = stringResource(KMR.strings.pref_mangabaka_covers_summary),
                 ),
+                Preference.PreferenceItem.ListPreference(
+                    preference = libraryPreferences.mangaBakaCoverLanguage(),
+                    entries = persistentMapOf(
+                        "ja" to "Japanese",
+                        "en" to "English",
+                        "fr" to "French",
+                        "de" to "German",
+                        "es" to "Spanish",
+                        "es-la" to "Spanish (Latin America)",
+                        "it" to "Italian",
+                        "pt" to "Portuguese",
+                        "zh" to "Chinese",
+                    ),
+                    title = stringResource(KMR.strings.pref_mangabaka_cover_language),
+                ),
                 // KMK <--
                 Preference.PreferenceItem.MultiSelectListPreference(
                     preference = libraryPreferences.autoUpdateMangaRestrictions(),
