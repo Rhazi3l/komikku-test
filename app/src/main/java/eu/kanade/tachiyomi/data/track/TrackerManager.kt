@@ -15,14 +15,8 @@ import kotlinx.coroutines.flow.combine
 class TrackerManager {
 
     companion object {
-        // KMK -->
-        const val MYANIMELIST = 1L
-        // KMK <--
         const val ANILIST = 2L
         const val KITSU = 3L
-        // KMK -->
-        const val MANGA_UPDATES = 7L
-        // KMK <--
         const val KAVITA = 8L
 
         // SY --> Mangadex from Neko
@@ -32,13 +26,13 @@ class TrackerManager {
 
     val mdList = MdList(MDLIST)
 
-    val myAnimeList = MyAnimeList(MYANIMELIST)
+    val myAnimeList = MyAnimeList(1L)
     val aniList = Anilist(ANILIST)
     val kitsu = Kitsu(KITSU)
     val shikimori = Shikimori(4L)
     val bangumi = Bangumi(5L)
     val komga = Komga(6L)
-    val mangaUpdates = MangaUpdates(MANGA_UPDATES)
+    val mangaUpdates = MangaUpdates(7L)
     val kavita = Kavita(KAVITA)
     val suwayomi = Suwayomi(9L)
 

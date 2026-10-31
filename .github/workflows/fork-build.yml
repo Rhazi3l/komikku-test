@@ -20,6 +20,9 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Check formatting (spotless, as upstream CI does)
+        run: ./gradlew spotlessCheck
+
       - name: Build release APK (no telemetry, no updater)
         run: ./gradlew assembleRelease
 

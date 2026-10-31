@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.util.system.notify
+import exh.log.xLogW
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -25,11 +26,9 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import logcat.LogPriority
 import okhttp3.Request
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.util.lang.withIOContext
-import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.libraryUpdateError.interactor.InsertLibraryUpdateErrors
 import tachiyomi.domain.libraryUpdateError.model.LibraryUpdateError
@@ -43,6 +42,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
 import java.io.IOException
+import kotlin.math.floor
 
 /**
  * Replaces the cover of a library manga with the latest volume cover in the chosen language (default Japanese)
@@ -58,12 +58,21 @@ class MangaBakaCoverUpdater(
     private val coverCache: CoverCache = Injekt.get(),
     private val updateManga: UpdateManga = Injekt.get(),
     private val networkHelper: NetworkHelper = Injekt.get(),
+    private val trackerManager: TrackerManager = Injekt.get(),
     private val application: Application = Injekt.get(),
     private val insertLibraryUpdateErrors: InsertLibraryUpdateErrors = Injekt.get(),
     private val insertLibraryUpdateErrorMessages: InsertLibraryUpdateErrorMessages = Injekt.get(),
 ) {
 
     private val client get() = networkHelper.client
+
+    /** Tracker ID to MangaBaka source name, in order of preference. */
+    private val sources = listOf(
+        trackerManager.aniList.id to "anilist",
+        trackerManager.myAnimeList.id to "my-anime-list",
+        trackerManager.kitsu.id to "kitsu",
+        trackerManager.mangaUpdates.id to "manga-updates",
+    )
     private val json = Json { ignoreUnknownKeys = true }
 
     /**
@@ -179,7 +188,7 @@ class MangaBakaCoverUpdater(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            logcat(LogPriority.WARN, e) { "MangaBaka cover update failed for '${manga.title}'" }
+            xLogW("MangaBaka cover update failed for '${manga.title}'", e)
             Outcome.Failed(e.message ?: e::class.simpleName.orEmpty())
         }
     }
@@ -213,15 +222,15 @@ class MangaBakaCoverUpdater(
             return Outcome.UserCover
         }
         // Checked recently in this language (also covers titles MangaBaka has nothing for).
-        val lastCheck = marker?.takeIf { it.checkedLanguage == language }?.checkedAt
+        val lastCheck = marker?.takeIf { it.language == language }?.checkedAt
         if (!force && lastCheck != null && now() - lastCheck < RECHECK_MS) return Outcome.CheckedRecently
 
         val tracks = getTracks.await(manga.id)
-        val candidates = SOURCES.mapNotNull { (trackerId, source) ->
+        val candidates = sources.mapNotNull { (trackerId, source) ->
             val remoteId = tracks.firstOrNull { it.trackerId == trackerId }?.remoteId?.takeIf { it > 0 }
                 ?: return@mapNotNull null
             // MangaBaka identifies MangaUpdates series by the base-36 form of the numeric ID.
-            val id = if (trackerId == TrackerManager.MANGA_UPDATES) remoteId.toString(36) else remoteId.toString()
+            val id = if (trackerId == trackerManager.mangaUpdates.id) remoteId.toString(36) else remoteId.toString()
             source to id
         }
         if (candidates.isEmpty()) return Outcome.NotTracked
@@ -230,25 +239,27 @@ class MangaBakaCoverUpdater(
         val seriesId = candidates.firstNotNullOfOrNull { (source, id) -> resolveSeriesId(source, id) }
         val latest = seriesId?.let { latestVolumeCover(it, language) }
         if (seriesId == null || latest == null) {
-            // Remember "nothing found" so it is not looked up on every update. A cover we wrote earlier
-            // (for example in another language) stays as it is.
-            val checked = now()
-            val kept = if (coverFile.exists()) marker?.copy(checkedAt = checked, checkedLanguage = language) else null
-            writeMarker(markerFile, kept ?: Marker(0, "", checked, 0, language, language))
+            // No covers in this language: go back to the source's cover, and remember the miss so it is
+            // not looked up again on every update.
+            if (coverFile.exists()) {
+                coverCache.deleteCustomCover(manga.id)
+                updateManga.awaitUpdateCoverLastModified(manga.id)
+            }
+            writeMarker(markerFile, Marker(0, "", now(), 0, language))
             return Outcome.NoCovers
         }
         val (index, imageUrl) = latest
 
         // The cover on disk is already this volume in this language.
         if (coverFile.exists() && marker != null && marker.isCover(seriesId, index, language)) {
-            writeMarker(markerFile, marker.copy(checkedAt = now(), checkedLanguage = language))
+            writeMarker(markerFile, marker.copy(checkedAt = now()))
             return Outcome.Unchanged
         }
 
         val bytes = fetch(imageUrl) ?: throw HttpException(HTTP_NOT_FOUND)
         if (bytes.isEmpty()) return Outcome.Failed("empty image")
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
-        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, language))
+        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language))
         updateManga.awaitUpdateCoverLastModified(manga.id)
         return Outcome.Updated(index)
     }
@@ -264,7 +275,7 @@ class MangaBakaCoverUpdater(
         return merged["data"]?.jsonObject?.long("id") ?: mergedWith
     }
 
-    /** Highest whole-number volume with a cover in [language], as (index, image URL). */
+    /** Latest volume with a cover in [language], as (volume label, image URL). */
     private suspend fun latestVolumeCover(seriesId: Long, language: String): Pair<String, String>? {
         var best: Triple<Double, String, String>? = null
         var page = 1
@@ -273,14 +284,18 @@ class MangaBakaCoverUpdater(
                 ?: break
             val items = root["data"] as? JsonArray ?: break
             for (item in items.map { it.jsonObject }) {
-                // Use the label ("3") rather than index_numeric: alternate editions of volume 3 have 3.1 there.
-                val number = item.str("index")?.toIntOrNull()?.toDouble() ?: continue // skips "2.5", "Box set"
+                // Rank by the volume in the label: "3", or "3.1" for an alternate edition of volume 3, which
+                // only counts when volume 3 itself has no cover. index_numeric is not used, as it does not
+                // always follow the label. Labels that are not numbers ("Box set") are skipped.
+                val label = item.str("index")?.takeIf { VOLUME_LABEL.matches(it) } ?: continue
+                val number = label.toDouble()
+                val rank = floor(number) * 2 + if (number == floor(number)) 1 else 0
                 val image = item["image"]?.jsonObject ?: continue
                 val url = image["x350"]?.jsonObject?.str("x2")
                     ?: image["raw"]?.jsonObject?.str("url")
                     ?: continue
-                if (best == null || number > best.first) {
-                    best = Triple(number, item.str("index") ?: number.toLong().toString(), url)
+                if (best == null || rank > best.first) {
+                    best = Triple(rank, label, url)
                 }
             }
             val next = root["pagination"]?.jsonObject?.get("next")
@@ -332,46 +347,31 @@ class MangaBakaCoverUpdater(
 
     private fun now() = System.currentTimeMillis()
 
-    /**
-     * What this class last did for a title. [language] is the language of the cover on disk,
-     * [checkedLanguage] the language last looked up (they differ when that language had no covers).
-     * A miss is stored with seriesId 0.
-     */
+    /** What this class last wrote for a title, in [language]. A miss (no covers) is stored with seriesId 0. */
     private data class Marker(
         val seriesId: Long,
         val index: String,
         val checkedAt: Long,
         val coverModified: Long,
         val language: String,
-        val checkedLanguage: String,
     ) {
         fun isCover(seriesId: Long, index: String, language: String) =
             this.seriesId == seriesId && this.index == index && this.language == language
     }
 
     private fun readMarker(file: File): Marker? = runCatching {
-        val parts = file.readText().trim().split('|')
-        val language = parts.getOrNull(4) ?: "ja" // markers from before the language option are Japanese
-        val checkedLanguage = parts.getOrNull(5) ?: language
-        // Markers from builds before the volume-label fix may point at the wrong volume: check those again.
-        val checkedAt = if (parts.size >= 6) parts[2].toLong() else 0L
-        Marker(parts[0].toLong(), parts[1], checkedAt, parts[3].toLong(), language, checkedLanguage)
+        val (seriesId, index, checkedAt, coverModified, language) = file.readText().trim().split('|')
+        Marker(seriesId.toLong(), index, checkedAt.toLong(), coverModified.toLong(), language)
     }.getOrNull()
 
     private fun writeMarker(file: File, m: Marker) {
-        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}|${m.checkedLanguage}")
+        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}")
     }
 
     private companion object {
         const val API = "https://api.mangabaka.org"
+        val VOLUME_LABEL = Regex("""\d+(\.\d+)?""")
 
-        /** Komikku tracker ID to MangaBaka source name, in order of preference. */
-        val SOURCES = listOf(
-            TrackerManager.ANILIST to "anilist",
-            TrackerManager.MYANIMELIST to "my-anime-list",
-            TrackerManager.KITSU to "kitsu",
-            TrackerManager.MANGA_UPDATES to "manga-updates",
-        )
         const val RECHECK_MS = 24L * 60 * 60 * 1000
         const val MAX_PAGES = 20
         const val HTTP_NOT_FOUND = 404

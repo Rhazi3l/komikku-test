@@ -48,6 +48,7 @@ import tachiyomi.presentation.core.i18n.stringResource
 import tachiyomi.presentation.core.util.collectAsState
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.util.Locale
 
 object SettingsLibraryScreen : SearchableSettings {
     @Suppress("unused")
@@ -229,17 +230,10 @@ object SettingsLibraryScreen : SearchableSettings {
                 ),
                 Preference.PreferenceItem.ListPreference(
                     preference = libraryPreferences.mangaBakaCoverLanguage(),
-                    entries = persistentMapOf(
-                        "ja" to "Japanese",
-                        "en" to "English",
-                        "fr" to "French",
-                        "de" to "German",
-                        "es" to "Spanish",
-                        "es-la" to "Spanish (Latin America)",
-                        "it" to "Italian",
-                        "pt" to "Portuguese",
-                        "zh" to "Chinese",
-                    ),
+                    // MangaBaka's language codes, named in the device language. "es-la" is Latin American Spanish.
+                    entries = "ja en ko zh zh-Hant fr de es es-la it pt pt-br ru".split(' ')
+                        .associateWith { Locale.forLanguageTag(it.replace("es-la", "es-419")).displayName }
+                        .toImmutableMap(),
                     title = stringResource(KMR.strings.pref_mangabaka_cover_language),
                     onValueChanged = { language ->
                         // Save first so the refresh started below already reads the new language.
