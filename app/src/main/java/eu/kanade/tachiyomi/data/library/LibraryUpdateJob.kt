@@ -96,6 +96,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.time.Instant
 import java.time.ZonedDateTime
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.atomics.AtomicBoolean
@@ -145,6 +146,9 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
     // KMK -->
     /** Every title in scope of this update, before the update restrictions (completed, unread, ...) are applied. */
     private var mangaForCovers: List<Manga> = emptyList()
+
+    /** Titles whose chapter update failed: their error is kept rather than replaced by a cover error. */
+    private val failedChapterUpdates = ConcurrentHashMap.newKeySet<Long>()
     // KMK <--
 
     override suspend fun doWork(): Result {
@@ -191,10 +195,16 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                     Target.CHAPTERS -> {
                         updateChapterList()
                         // KMK -->
-                        mangaBakaCoverUpdater.updateAll(mangaForCovers) { manga, done, total ->
+                        val coverFailures = mangaBakaCoverUpdater.updateAll(
+                            mangaList = mangaForCovers,
+                            keepErrorsFor = failedChapterUpdates,
+                        ) { manga, done, total ->
                             notifier.showProgressNotification(listOf(manga), done, total)
                         }
                         notifier.cancelProgressNotification()
+                        if (coverFailures > 0) {
+                            notifier.showUpdateErrorNotification(failedChapterUpdates.size + coverFailures)
+                        }
                         // KMK <--
                     }
                     // SY -->
@@ -498,6 +508,9 @@ class LibraryUpdateJob(private val context: Context, workerParams: WorkerParamet
                                         }
                                         writeErrorToDB(manga to errorMessage)
                                         failedUpdates.add(manga to errorMessage)
+                                        // KMK -->
+                                        failedChapterUpdates.add(manga.id)
+                                        // KMK <--
                                     }
                                 }
                             }

@@ -1,12 +1,17 @@
 package eu.kanade.tachiyomi.data.cover
 
 // KMK -->
+import android.app.Application
+import androidx.core.app.NotificationCompat
 import eu.kanade.domain.manga.interactor.UpdateManga
+import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.cache.CoverCache
+import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.await
+import eu.kanade.tachiyomi.util.system.notify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -21,16 +26,22 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import logcat.LogPriority
 import okhttp3.Request
-import okhttp3.Response
+import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.util.lang.withIOContext
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.library.service.LibraryPreferences
+import tachiyomi.domain.libraryUpdateError.interactor.InsertLibraryUpdateErrors
+import tachiyomi.domain.libraryUpdateError.model.LibraryUpdateError
+import tachiyomi.domain.libraryUpdateErrorMessage.interactor.InsertLibraryUpdateErrorMessages
+import tachiyomi.domain.libraryUpdateErrorMessage.model.LibraryUpdateErrorMessage
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.track.interactor.GetTracks
+import tachiyomi.i18n.kmk.KMR
 import tachiyomi.source.local.isLocal
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
+import java.io.IOException
 
 /**
  * Replaces the cover of a library manga with the latest volume cover in the chosen language (default Japanese)
@@ -46,32 +57,77 @@ class MangaBakaCoverUpdater(
     private val coverCache: CoverCache = Injekt.get(),
     private val updateManga: UpdateManga = Injekt.get(),
     private val networkHelper: NetworkHelper = Injekt.get(),
+    private val application: Application = Injekt.get(),
+    private val insertLibraryUpdateErrors: InsertLibraryUpdateErrors = Injekt.get(),
+    private val insertLibraryUpdateErrorMessages: InsertLibraryUpdateErrorMessages = Injekt.get(),
 ) {
 
     private val client get() = networkHelper.client
     private val json = Json { ignoreUnknownKeys = true }
 
     /**
-     * Updates covers for the whole list, one title at a time to stay inside MangaBaka's rate limit.
+     * Updates covers for every title in the list, one at a time to stay inside MangaBaka's rate limit.
      * Runs independently of the chapter-update restrictions (completed, unread, release window).
-     * With [force] the 7-day wait between checks is ignored, for refreshes the user asked for.
+     * With [force] the daily wait between checks is ignored, for refreshes the user asked for.
      * [onProgress] is called at most every [PROGRESS_INTERVAL_MS] with the title being checked.
+     *
+     * Failures are written to the library update error list, like failed chapter updates, except for
+     * titles in [keepErrorsFor] (titles whose chapter update already failed keep that error).
+     * A summary notification follows a forced pass, or any pass that changed or failed something.
+     * @return the number of titles that failed.
      */
     suspend fun updateAll(
         mangaList: List<Manga>,
         force: Boolean = false,
+        keepErrorsFor: Set<Long> = emptySet(),
         onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit = { _, _, _ -> },
-    ) {
-        if (!libraryPreferences.mangaBakaCovers().get()) return
+    ): Int {
+        if (!libraryPreferences.mangaBakaCovers().get()) return 0
         var lastProgress = 0L
+        var updated = 0
+        var unchanged = 0
+        var noCovers = 0
+        var notTracked = 0
+        var userCovers = 0
+        var failed = 0
         mangaList.forEachIndexed { done, manga ->
             currentCoroutineContext().ensureActive()
             if (now() - lastProgress >= PROGRESS_INTERVAL_MS) {
                 lastProgress = now()
                 onProgress(manga, done, mangaList.size)
             }
-            update(manga, force)
+            when (val outcome = update(manga, force)) {
+                is Outcome.Updated -> updated++
+                Outcome.Unchanged -> unchanged++
+                Outcome.NoCovers -> noCovers++
+                Outcome.NotTracked -> notTracked++
+                Outcome.UserCover -> userCovers++
+                is Outcome.Failed -> {
+                    failed++
+                    if (manga.id !in keepErrorsFor) writeError(manga, outcome.reason)
+                }
+                Outcome.CheckedRecently, Outcome.Skipped -> Unit
+            }
         }
+        if (force || updated > 0 || failed > 0) {
+            val text = application.stringResource(
+                KMR.strings.mangabaka_covers_result,
+                updated,
+                unchanged,
+                noCovers,
+                notTracked,
+                userCovers,
+                failed,
+            )
+            application.notify(NOTIFICATION_ID, Notifications.CHANNEL_LIBRARY_PROGRESS) {
+                setSmallIcon(R.drawable.ic_komikku)
+                setContentTitle(application.stringResource(KMR.strings.mangabaka_covers_result_title))
+                setContentText(text)
+                setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                setAutoCancel(true)
+            }
+        }
+        return failed
     }
 
     /** Never throws (except cancellation); any failure leaves the current cover untouched. */
@@ -84,7 +140,7 @@ class MangaBakaCoverUpdater(
             throw e
         } catch (e: Throwable) {
             logcat(LogPriority.WARN, e) { "MangaBaka cover update failed for '${manga.title}'" }
-            Outcome.Failed
+            Outcome.Failed(e.message ?: e::class.simpleName.orEmpty())
         }
     }
 
@@ -96,8 +152,14 @@ class MangaBakaCoverUpdater(
         data object NotTracked : Outcome
         data object UserCover : Outcome
         data object CheckedRecently : Outcome
-        data object Failed : Outcome
+        data class Failed(val reason: String) : Outcome
         data object Skipped : Outcome
+    }
+
+    private suspend fun writeError(manga: Manga, reason: String) {
+        val message = application.stringResource(KMR.strings.mangabaka_cover_failed, reason)
+        val messageId = insertLibraryUpdateErrorMessages.insert(LibraryUpdateErrorMessage(-1L, message))
+        insertLibraryUpdateErrors.upsert(LibraryUpdateError(id = -1L, mangaId = manga.id, messageId = messageId))
     }
 
     private suspend fun updateInternal(manga: Manga, force: Boolean): Outcome {
@@ -143,8 +205,8 @@ class MangaBakaCoverUpdater(
             return Outcome.Unchanged
         }
 
-        val bytes = get(imageUrl).use { it.body.bytes() }
-        if (bytes.isEmpty()) return Outcome.Failed
+        val bytes = fetch(imageUrl) ?: throw HttpException(HTTP_NOT_FOUND)
+        if (bytes.isEmpty()) return Outcome.Failed("empty image")
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
         writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, language))
         updateManga.awaitUpdateCoverLastModified(manga.id)
@@ -189,32 +251,41 @@ class MangaBakaCoverUpdater(
     }
 
     /** Null means "not found" (HTTP 404). Any other failure throws, so it is not remembered as a miss. */
-    private suspend fun getJson(url: String): JsonObject? {
-        return try {
-            get(url).use { json.parseToJsonElement(it.body.string()).jsonObject }
-        } catch (e: HttpException) {
-            if (e.code == HTTP_NOT_FOUND) null else throw e
+    private suspend fun getJson(url: String): JsonObject? =
+        fetch(url)?.let { json.parseToJsonElement(it.decodeToString()).jsonObject }
+
+    /**
+     * Downloads [url], spaced so a whole-library pass stays under the API's 180 requests per minute.
+     * Rate limits (HTTP 429, waiting as long as the server asks), server errors (5xx) and network errors
+     * are retried up to [MAX_ATTEMPTS] times with growing waits, so a busy moment does not skip a title.
+     * Returns null for HTTP 404 and throws for any other failure.
+     */
+    private suspend fun fetch(url: String): ByteArray? {
+        var attempt = 1
+        while (true) {
+            delay(REQUEST_SPACING_MS)
+            val wait = try {
+                client.newCall(Request.Builder().url(url).build()).await().use { response ->
+                    val code = response.code
+                    when {
+                        response.isSuccessful -> return response.body.bytes()
+                        code == HTTP_NOT_FOUND -> return null
+                        code != HTTP_TOO_MANY_REQUESTS && code < HTTP_SERVER_ERROR -> throw HttpException(code)
+                        attempt >= MAX_ATTEMPTS -> throw HttpException(code)
+                        else -> response.header("Retry-After")?.toLongOrNull()?.times(1000) ?: backoff(attempt)
+                    }
+                }
+            } catch (e: IOException) {
+                if (attempt >= MAX_ATTEMPTS) throw e
+                backoff(attempt)
+            }
+            delay(wait.coerceIn(RETRY_MIN_MS, RETRY_MAX_MS))
+            attempt++
         }
     }
 
-    /**
-     * GET, spaced so a whole-library pass stays under the API's 180 requests per minute, with one retry
-     * after the server's 10 s back-off on HTTP 429. Throws [HttpException] on any other failure.
-     */
-    private suspend fun get(url: String): Response {
-        delay(REQUEST_SPACING_MS)
-        var response = client.newCall(Request.Builder().url(url).build()).await()
-        if (response.code == HTTP_TOO_MANY_REQUESTS) {
-            response.close()
-            delay(RETRY_AFTER_MS)
-            response = client.newCall(Request.Builder().url(url).build()).await()
-        }
-        if (!response.isSuccessful) {
-            response.close()
-            throw HttpException(response.code)
-        }
-        return response
-    }
+    /** 10 s, 20 s, 40 s, 80 s. */
+    private fun backoff(attempt: Int) = RETRY_MIN_MS shl (attempt - 1)
 
     private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
     private fun JsonObject.long(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
@@ -261,13 +332,17 @@ class MangaBakaCoverUpdater(
             TrackerManager.KITSU to "kitsu",
             TrackerManager.MANGA_UPDATES to "manga-updates",
         )
-        const val RECHECK_MS = 7L * 24 * 60 * 60 * 1000
-        const val MAX_PAGES = 5
+        const val RECHECK_MS = 24L * 60 * 60 * 1000
+        const val MAX_PAGES = 20
         const val HTTP_NOT_FOUND = 404
         const val HTTP_TOO_MANY_REQUESTS = 429
-        const val RETRY_AFTER_MS = 10_000L
+        const val HTTP_SERVER_ERROR = 500
+        const val MAX_ATTEMPTS = 5
+        const val RETRY_MIN_MS = 10_000L
+        const val RETRY_MAX_MS = 120_000L
         const val REQUEST_SPACING_MS = 350L
         const val PROGRESS_INTERVAL_MS = 500L
+        const val NOTIFICATION_ID = -110
     }
 }
 // KMK <--

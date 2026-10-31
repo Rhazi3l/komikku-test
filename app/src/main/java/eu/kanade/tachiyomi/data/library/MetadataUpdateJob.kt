@@ -10,6 +10,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkQuery
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import eu.kanade.tachiyomi.data.cover.MangaBakaCoverUpdater
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.util.system.isRunning
@@ -60,12 +61,16 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
 
         return withIOContext {
             try {
-                updateMetadata()
                 // KMK -->
-                // "Refresh library covers" includes MangaBaka covers, ignoring the usual 7-day wait.
-                mangaBakaCoverUpdater.updateAll(mangaToUpdate.map { it.manga }, force = true) { manga, done, total ->
+                if (!inputData.getBoolean(KEY_MANGABAKA_ONLY, false)) updateMetadata()
+                // "Refresh library covers" also checks every MangaBaka cover, ignoring the usual daily wait.
+                val coverFailures = mangaBakaCoverUpdater.updateAll(
+                    mangaList = mangaToUpdate.map { it.manga },
+                    force = true,
+                ) { manga, done, total ->
                     notifier.showProgressNotification(listOf(manga), done, total)
                 }
+                notifier.showUpdateErrorNotification(coverFailures)
                 // KMK <--
                 Result.success()
             } catch (e: Exception) {
@@ -195,6 +200,23 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
 
             return true
         }
+
+        // KMK -->
+        /**
+         * Re-checks every MangaBaka cover without refreshing the sources' covers, for example after the
+         * cover language changed. Replaces a refresh already running, so the new language applies to all.
+         */
+        fun startMangaBakaCovers(context: Context) {
+            val request = OneTimeWorkRequestBuilder<MetadataUpdateJob>()
+                .addTag(TAG)
+                .addTag(WORK_NAME_MANUAL)
+                .setInputData(workDataOf(KEY_MANGABAKA_ONLY to true))
+                .build()
+            context.workManager.enqueueUniqueWork(WORK_NAME_MANUAL, ExistingWorkPolicy.REPLACE, request)
+        }
+
+        private const val KEY_MANGABAKA_ONLY = "mangabaka_only"
+        // KMK <--
 
         fun stop(context: Context) {
             val wm = context.workManager

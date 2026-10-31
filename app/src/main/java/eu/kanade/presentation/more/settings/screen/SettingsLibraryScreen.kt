@@ -19,6 +19,7 @@ import eu.kanade.presentation.category.visualName
 import eu.kanade.presentation.more.settings.Preference
 import eu.kanade.presentation.more.settings.widget.TriStateListDialog
 import eu.kanade.tachiyomi.data.library.LibraryUpdateJob
+import eu.kanade.tachiyomi.data.library.MetadataUpdateJob
 import eu.kanade.tachiyomi.ui.category.CategoryScreen
 import eu.kanade.tachiyomi.ui.category.genre.SortTagScreen
 import kotlinx.collections.immutable.persistentListOf
@@ -234,6 +235,12 @@ object SettingsLibraryScreen : SearchableSettings {
                         "zh" to "Chinese",
                     ),
                     title = stringResource(KMR.strings.pref_mangabaka_cover_language),
+                    onValueChanged = { language ->
+                        // Save first so the refresh started below already reads the new language.
+                        libraryPreferences.mangaBakaCoverLanguage().set(language)
+                        if (libraryPreferences.mangaBakaCovers().get()) MetadataUpdateJob.startMangaBakaCovers(context)
+                        true
+                    },
                 ),
                 // KMK <--
                 Preference.PreferenceItem.MultiSelectListPreference(

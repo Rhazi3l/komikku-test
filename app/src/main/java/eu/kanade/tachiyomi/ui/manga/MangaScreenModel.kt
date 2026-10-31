@@ -597,7 +597,7 @@ class MangaScreenModel(
             )
             // KMK -->
             launch { syncTrackers() }
-            // A refresh the user asked for also re-checks the MangaBaka cover, ignoring the 7-day wait.
+            // A refresh the user asked for also re-checks the MangaBaka cover, ignoring the usual daily wait.
             if (manualFetch) {
                 successState?.manga?.let { manga ->
                     launch {
@@ -663,7 +663,8 @@ class MangaScreenModel(
         MangaBakaCoverUpdater.Outcome.NoCovers -> context.stringResource(KMR.strings.mangabaka_cover_none)
         MangaBakaCoverUpdater.Outcome.NotTracked -> context.stringResource(KMR.strings.mangabaka_cover_not_tracked)
         MangaBakaCoverUpdater.Outcome.UserCover -> context.stringResource(KMR.strings.mangabaka_cover_user)
-        MangaBakaCoverUpdater.Outcome.Failed -> context.stringResource(KMR.strings.mangabaka_cover_failed)
+        is MangaBakaCoverUpdater.Outcome.Failed ->
+            context.stringResource(KMR.strings.mangabaka_cover_failed, outcome.reason)
         MangaBakaCoverUpdater.Outcome.CheckedRecently, MangaBakaCoverUpdater.Outcome.Skipped -> null
     }
 
