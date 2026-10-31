@@ -249,4 +249,6 @@
     <string name="mangabaka_cover_failed">MangaBaka cover failed: %1$s</string>
     <string name="mangabaka_covers_result_title">MangaBaka covers checked</string>
     <string name="mangabaka_covers_result">Updated: %1$d\nAlready latest: %2$d\nNo covers in this language: %3$d\nNot tracked: %4$d\nYour own cover kept: %5$d\nFailed: %6$d</string>
+    <string name="mangabaka_covers_restored_title">MangaBaka covers turned off</string>
+    <string name="mangabaka_covers_restored">Source covers restored for %1$d titles</string>
 </resources>

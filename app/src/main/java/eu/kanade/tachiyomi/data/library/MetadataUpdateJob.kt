@@ -11,6 +11,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkQuery
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import eu.kanade.tachiyomi.data.LibraryUpdateStatus
 import eu.kanade.tachiyomi.data.cover.MangaBakaCoverUpdater
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.util.system.isRunning
@@ -48,6 +49,7 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
 
     // KMK -->
     private val mangaBakaCoverUpdater = MangaBakaCoverUpdater()
+    private val libraryUpdateStatus: LibraryUpdateStatus = Injekt.get()
     // KMK <--
 
     private val notifier = LibraryUpdateNotifier(context)
@@ -62,15 +64,24 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
         return withIOContext {
             try {
                 // KMK -->
-                if (!inputData.getBoolean(KEY_MANGABAKA_ONLY, false)) updateMetadata()
-                // "Refresh library covers" also checks every MangaBaka cover, ignoring the usual daily wait.
-                val coverFailures = mangaBakaCoverUpdater.updateAll(
-                    mangaList = mangaToUpdate.map { it.manga },
-                    force = true,
-                ) { manga, done, total ->
+                // Show the in-app progress banner, as a library update does.
+                libraryUpdateStatus.start()
+                val mangaBakaMode = inputData.getString(KEY_MANGABAKA_MODE)
+                val showProgress: suspend (Manga, Int, Int) -> Unit = { manga, done, total ->
                     notifier.showProgressNotification(listOf(manga), done, total)
                 }
-                notifier.showUpdateErrorNotification(coverFailures)
+                if (mangaBakaMode == MODE_RESTORE) {
+                    mangaBakaCoverUpdater.restoreSourceCovers(mangaToUpdate.map { it.manga }, showProgress)
+                } else {
+                    if (mangaBakaMode == null) updateMetadata()
+                    // "Refresh library covers" also checks every MangaBaka cover, ignoring the usual daily wait.
+                    val coverFailures = mangaBakaCoverUpdater.updateAll(
+                        mangaList = mangaToUpdate.map { it.manga },
+                        force = true,
+                        onProgress = showProgress,
+                    )
+                    notifier.showUpdateErrorNotification(coverFailures)
+                }
                 // KMK <--
                 Result.success()
             } catch (e: Exception) {
@@ -83,6 +94,9 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
                 }
             } finally {
                 notifier.cancelProgressNotification()
+                // KMK -->
+                libraryUpdateStatus.stop()
+                // KMK <--
             }
         }
     }
@@ -203,19 +217,22 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
 
         // KMK -->
         /**
-         * Re-checks every MangaBaka cover without refreshing the sources' covers, for example after the
-         * cover language changed. Replaces a refresh already running, so the new language applies to all.
+         * Re-checks every MangaBaka cover without refreshing the sources' covers (after the feature is
+         * turned on or the cover language changes), or with [restore] puts the sources' covers back
+         * (after it is turned off). Replaces a refresh already running, so the latest setting wins.
          */
-        fun startMangaBakaCovers(context: Context) {
+        fun startMangaBakaCovers(context: Context, restore: Boolean = false) {
             val request = OneTimeWorkRequestBuilder<MetadataUpdateJob>()
                 .addTag(TAG)
                 .addTag(WORK_NAME_MANUAL)
-                .setInputData(workDataOf(KEY_MANGABAKA_ONLY to true))
+                .setInputData(workDataOf(KEY_MANGABAKA_MODE to if (restore) MODE_RESTORE else MODE_CHECK))
                 .build()
             context.workManager.enqueueUniqueWork(WORK_NAME_MANUAL, ExistingWorkPolicy.REPLACE, request)
         }
 
-        private const val KEY_MANGABAKA_ONLY = "mangabaka_only"
+        private const val KEY_MANGABAKA_MODE = "mangabaka_mode"
+        private const val MODE_CHECK = "check"
+        private const val MODE_RESTORE = "restore"
         // KMK <--
 
         fun stop(context: Context) {

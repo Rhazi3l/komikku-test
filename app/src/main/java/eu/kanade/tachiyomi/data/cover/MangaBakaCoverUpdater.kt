@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.data.cover
 // KMK -->
 import android.app.Application
 import androidx.core.app.NotificationCompat
+import dev.icerock.moko.resources.StringResource
 import eu.kanade.domain.manga.interactor.UpdateManga
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.cache.CoverCache
@@ -110,24 +111,63 @@ class MangaBakaCoverUpdater(
             }
         }
         if (force || updated > 0 || failed > 0) {
-            val text = application.stringResource(
-                KMR.strings.mangabaka_covers_result,
-                updated,
-                unchanged,
-                noCovers,
-                notTracked,
-                userCovers,
-                failed,
+            showResult(
+                KMR.strings.mangabaka_covers_result_title,
+                application.stringResource(
+                    KMR.strings.mangabaka_covers_result,
+                    updated,
+                    unchanged,
+                    noCovers,
+                    notTracked,
+                    userCovers,
+                    failed,
+                ),
             )
-            application.notify(NOTIFICATION_ID, Notifications.CHANNEL_LIBRARY_PROGRESS) {
-                setSmallIcon(R.drawable.ic_komikku)
-                setContentTitle(application.stringResource(KMR.strings.mangabaka_covers_result_title))
-                setContentText(text)
-                setStyle(NotificationCompat.BigTextStyle().bigText(text))
-                setAutoCancel(true)
-            }
         }
         return failed
+    }
+
+    /**
+     * Puts the source's own cover back for every title whose cover this class wrote, for when the
+     * feature is turned off. Covers the user set by hand stay. Markers are removed too, so turning the
+     * feature back on checks every title afresh.
+     */
+    suspend fun restoreSourceCovers(
+        mangaList: List<Manga>,
+        onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit = { _, _, _ -> },
+    ) = withIOContext {
+        var lastProgress = 0L
+        var restored = 0
+        mangaList.forEachIndexed { done, manga ->
+            currentCoroutineContext().ensureActive()
+            if (now() - lastProgress >= PROGRESS_INTERVAL_MS) {
+                lastProgress = now()
+                onProgress(manga, done, mangaList.size)
+            }
+            val coverFile = coverCache.getCustomCoverFile(manga.id)
+            val markerFile = File(coverFile.parentFile, coverFile.name + ".mb")
+            val marker = readMarker(markerFile) ?: return@forEachIndexed
+            if (coverFile.exists() && marker.coverModified == coverFile.lastModified()) {
+                coverCache.deleteCustomCover(manga.id)
+                updateManga.awaitUpdateCoverLastModified(manga.id)
+                restored++
+            }
+            markerFile.delete()
+        }
+        showResult(
+            KMR.strings.mangabaka_covers_restored_title,
+            application.stringResource(KMR.strings.mangabaka_covers_restored, restored),
+        )
+    }
+
+    private fun showResult(title: StringResource, text: String) {
+        application.notify(NOTIFICATION_ID, Notifications.CHANNEL_LIBRARY_PROGRESS) {
+            setSmallIcon(R.drawable.ic_komikku)
+            setContentTitle(application.stringResource(title))
+            setContentText(text)
+            setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            setAutoCancel(true)
+        }
     }
 
     /** Never throws (except cancellation); any failure leaves the current cover untouched. */

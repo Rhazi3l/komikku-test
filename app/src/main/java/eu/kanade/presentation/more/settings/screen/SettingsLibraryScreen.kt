@@ -220,6 +220,12 @@ object SettingsLibraryScreen : SearchableSettings {
                     preference = libraryPreferences.mangaBakaCovers(),
                     title = stringResource(KMR.strings.pref_mangabaka_covers),
                     subtitle = stringResource(KMR.strings.pref_mangabaka_covers_summary),
+                    onValueChanged = { enabled ->
+                        // On: fetch MangaBaka covers now. Off: put the sources' covers back.
+                        libraryPreferences.mangaBakaCovers().set(enabled)
+                        MetadataUpdateJob.startMangaBakaCovers(context, restore = !enabled)
+                        true
+                    },
                 ),
                 Preference.PreferenceItem.ListPreference(
                     preference = libraryPreferences.mangaBakaCoverLanguage(),
