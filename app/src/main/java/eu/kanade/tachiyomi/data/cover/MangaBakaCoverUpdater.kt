@@ -14,7 +14,6 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -129,8 +128,8 @@ class MangaBakaCoverUpdater(
                 ?: break
             val items = root["data"] as? JsonArray ?: break
             for (item in items.map { it.jsonObject }) {
-                val number = item["index_numeric"]?.jsonPrimitive?.doubleOrNull ?: continue
-                if (number % 1.0 != 0.0) continue // skip 1.1, 2.5 and similar
+                // Use the label ("3") rather than index_numeric: alternate editions of volume 3 have 3.1 there.
+                val number = item.str("index")?.toIntOrNull()?.toDouble() ?: continue // skips "2.5", "Box set"
                 val image = item["image"]?.jsonObject ?: continue
                 val url = image["x350"]?.jsonObject?.str("x2")
                     ?: image["raw"]?.jsonObject?.str("url")
