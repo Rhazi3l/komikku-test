@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.cover
 
 // KMK -->
 import android.app.Application
+import android.graphics.BitmapFactory
 import androidx.core.app.NotificationCompat
 import dev.icerock.moko.resources.StringResource
 import eu.kanade.domain.manga.interactor.UpdateManga
@@ -12,12 +13,15 @@ import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.await
+import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.util.system.notify
 import exh.log.xLogW
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -74,6 +78,7 @@ class MangaBakaCoverUpdater(
         trackerManager.mangaUpdates.id to "manga-updates",
     )
     private val json = Json { ignoreUnknownKeys = true }
+    private var lastApiCall = 0L
 
     /**
      * Updates covers for every title in the list, one at a time to stay inside MangaBaka's rate limit.
@@ -91,8 +96,8 @@ class MangaBakaCoverUpdater(
         force: Boolean = false,
         keepErrorsFor: Set<Long> = emptySet(),
         onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit = { _, _, _ -> },
-    ): Int {
-        if (!libraryPreferences.mangaBakaCovers().get()) return 0
+    ): Int = passLock.withLock {
+        if (!libraryPreferences.mangaBakaCovers().get()) return@withLock 0
         var lastProgress = 0L
         var updated = 0
         var unchanged = 0
@@ -133,7 +138,7 @@ class MangaBakaCoverUpdater(
                 ),
             )
         }
-        return failed
+        failed
     }
 
     /**
@@ -144,7 +149,14 @@ class MangaBakaCoverUpdater(
     suspend fun restoreSourceCovers(
         mangaList: List<Manga>,
         onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit = { _, _, _ -> },
-    ) = withIOContext {
+    ) = passLock.withLock {
+        withIOContext { restoreAll(mangaList, onProgress) }
+    }
+
+    private suspend fun restoreAll(
+        mangaList: List<Manga>,
+        onProgress: suspend (manga: Manga, done: Int, total: Int) -> Unit,
+    ) {
         var lastProgress = 0L
         var restored = 0
         mangaList.forEachIndexed { done, manga ->
@@ -156,7 +168,7 @@ class MangaBakaCoverUpdater(
             val coverFile = coverCache.getCustomCoverFile(manga.id)
             val markerFile = File(coverFile.parentFile, coverFile.name + ".mb")
             val marker = readMarker(markerFile) ?: return@forEachIndexed
-            if (coverFile.exists() && marker.coverModified == coverFile.lastModified()) {
+            if (coverFile.exists() && marker.owns(coverFile)) {
                 coverCache.deleteCustomCover(manga.id)
                 updateManga.awaitUpdateCoverLastModified(manga.id)
                 restored++
@@ -218,15 +230,14 @@ class MangaBakaCoverUpdater(
         val marker = readMarker(markerFile)
 
         // A custom cover we did not write (or that was changed since) belongs to the user.
-        if (coverFile.exists() && (marker == null || marker.coverModified != coverFile.lastModified())) {
-            return Outcome.UserCover
-        }
+        if (coverFile.exists() && marker?.owns(coverFile) != true) return Outcome.UserCover
         // Checked recently in this language (also covers titles MangaBaka has nothing for).
+        val recheck = if (manga.status == SManga.COMPLETED.toLong()) RECHECK_COMPLETED_MS else RECHECK_MS
         val lastCheck = marker?.takeIf { it.language == language }?.checkedAt
-        if (!force && lastCheck != null && now() - lastCheck < RECHECK_MS) return Outcome.CheckedRecently
+        if (!force && lastCheck != null && now() - lastCheck < recheck) return Outcome.CheckedRecently
 
         val tracks = getTracks.await(manga.id)
-        val candidates = sources.mapNotNull { (trackerId, source) ->
+        val links = sources.mapNotNull { (trackerId, source) ->
             val remoteId = tracks.firstOrNull { it.trackerId == trackerId }?.remoteId?.takeIf { it > 0 }
                 ?: return@mapNotNull null
             // MangaBaka identifies MangaUpdates series by the 7-character base-36 form of the numeric ID.
@@ -235,46 +246,61 @@ class MangaBakaCoverUpdater(
             } else {
                 remoteId.toString()
             }
-            source to id
+            "$source/$id"
         }
-        if (candidates.isEmpty()) return Outcome.NotTracked
+        if (links.isEmpty()) return Outcome.NotTracked
 
-        // Try each linked tracker in order until MangaBaka knows the series.
-        val seriesId = candidates.firstNotNullOfOrNull { (source, id) -> resolveSeriesId(source, id) }
-        val latest = seriesId?.let { latestVolumeCover(it, language) }
-        if (seriesId == null || latest == null) {
+        // Reuse the series found last time while that tracker link is unchanged, saving a lookup. If it has
+        // no cover now (it may have been merged into another series), look the series up again.
+        var series = marker?.takeIf { it.seriesId > 0 && it.link in links }?.let { it.seriesId to it.link }
+        var latest = series?.let { latestVolumeCover(it.first, language) }
+        if (latest == null) {
+            // Try each linked tracker in order until MangaBaka knows the series.
+            series = links.firstNotNullOfOrNull { link -> resolveSeriesId(link)?.let { it to link } }
+            latest = series?.let { latestVolumeCover(it.first, language) }
+        }
+        if (series == null || latest == null) {
             // No covers in this language: go back to the source's cover, and remember the miss so it is
             // not looked up again on every update.
             if (coverFile.exists()) {
                 coverCache.deleteCustomCover(manga.id)
                 updateManga.awaitUpdateCoverLastModified(manga.id)
             }
-            writeMarker(markerFile, Marker(0, "", now(), 0, language))
+            writeMarker(markerFile, Marker(0, "", now(), 0, language, ""))
             return Outcome.NoCovers
         }
+        val (seriesId, link) = series
         val (index, imageUrl) = latest
 
         // The cover on disk is already this volume in this language.
         if (coverFile.exists() && marker != null && marker.isCover(seriesId, index, language)) {
-            writeMarker(markerFile, marker.copy(checkedAt = now()))
+            writeMarker(markerFile, marker.copy(checkedAt = now(), link = link))
             return Outcome.Unchanged
         }
 
         val bytes = fetch(imageUrl) ?: throw HttpException(HTTP_NOT_FOUND)
-        if (bytes.isEmpty()) return Outcome.Failed("empty image")
+        // Only accept an actual image (not an error page served with HTTP 200).
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0) return Outcome.Failed("not an image")
+        // Claim the cover first, so a write cut short is not mistaken for the user's own cover later.
+        writeMarker(markerFile, Marker(seriesId, index, 0, WRITING, language, link))
         coverCache.setCustomCoverToCache(manga, bytes.inputStream())
-        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language))
+        writeMarker(markerFile, Marker(seriesId, index, now(), coverFile.lastModified(), language, link))
         updateManga.awaitUpdateCoverLastModified(manga.id)
         return Outcome.Updated(index)
     }
 
-    private suspend fun resolveSeriesId(source: String, id: String): Long? {
-        val root = getJson("$API/v1/source/$source/$id") ?: return null
-        val series = root["data"]?.jsonObject?.get("series")?.jsonArray ?: return null
-        val active = series.map { it.jsonObject }.firstOrNull { it.str("state") == "active" }
+    /** The active MangaBaka series for a tracker link ("anilist/30642"), skipping light novels. */
+    private suspend fun resolveSeriesId(link: String): Long? {
+        val root = getJson("$API/v1/source/$link") ?: return null
+        val series = root["data"]?.jsonObject?.get("series")?.jsonArray?.map { it.jsonObject }
+            ?.filter { it.str("type") != "novel" }
+            ?: return null
+        val active = series.firstOrNull { it.str("state") == "active" }
         if (active != null) return active.long("id")
         // Follow a merge once.
-        val mergedWith = series.map { it.jsonObject }.firstNotNullOfOrNull { it.long("merged_with") } ?: return null
+        val mergedWith = series.firstNotNullOfOrNull { it.long("merged_with") } ?: return null
         val merged = getJson("$API/v1/series/$mergedWith") ?: return mergedWith
         return merged["data"]?.jsonObject?.long("id") ?: mergedWith
     }
@@ -288,8 +314,9 @@ class MangaBakaCoverUpdater(
                 ?: break
             val items = root["data"] as? JsonArray ?: break
             for (item in items.map { it.jsonObject }) {
-                // Front covers only; back covers are "volume_back" (the query asks for these, this makes sure).
-                if (item.str("type") != "volume") continue
+                // Front covers in this language only (the query asks for these; this makes sure).
+                // Back covers are "volume_back".
+                if (item.str("type") != "volume" || !item.str("language").equals(language, ignoreCase = true)) continue
                 // Rank by the volume in the label: "3", or "3.1" for an alternate edition of volume 3, which
                 // only counts when volume 3 itself has no cover. index_numeric is not used, as it does not
                 // always follow the label. Labels that are not numbers ("Box set") are skipped.
@@ -316,7 +343,7 @@ class MangaBakaCoverUpdater(
         fetch(url)?.let { json.parseToJsonElement(it.decodeToString()).jsonObject }
 
     /**
-     * Downloads [url], spaced so a whole-library pass stays under the API's 180 requests per minute.
+     * Downloads [url]. API calls are spaced so a whole-library pass stays under 180 requests per minute.
      * Rate limits (HTTP 429, waiting as long as the server asks), server errors (5xx) and network errors
      * are retried up to [MAX_ATTEMPTS] times with growing waits, so a busy moment does not skip a title.
      * Returns null for HTTP 404 and throws for any other failure.
@@ -324,7 +351,11 @@ class MangaBakaCoverUpdater(
     private suspend fun fetch(url: String): ByteArray? {
         var attempt = 1
         while (true) {
-            delay(REQUEST_SPACING_MS)
+            if (url.startsWith(API)) {
+                // Image downloads come from the CDN and are not rate limited.
+                delay(REQUEST_SPACING_MS - (now() - lastApiCall))
+                lastApiCall = now()
+            }
             val wait = try {
                 client.newCall(Request.Builder().url(url).build()).await().use { response ->
                     val code = response.code
@@ -353,32 +384,46 @@ class MangaBakaCoverUpdater(
 
     private fun now() = System.currentTimeMillis()
 
-    /** What this class last wrote for a title, in [language]. A miss (no covers) is stored with seriesId 0. */
+    /**
+     * What this class last wrote for a title, in [language], found through tracker [link].
+     * A miss (no covers) is stored with seriesId 0; a cover being written has coverModified [WRITING].
+     */
     private data class Marker(
         val seriesId: Long,
         val index: String,
         val checkedAt: Long,
         val coverModified: Long,
         val language: String,
+        val link: String,
     ) {
-        fun isCover(seriesId: Long, index: String, language: String) =
+        fun isCover(seriesId: Long, index: String, language: String) = coverModified != WRITING &&
             this.seriesId == seriesId && this.index == index && this.language == language
+
+        /** The cover file is the one this class wrote (or was writing when interrupted). */
+        fun owns(coverFile: File) = coverModified == WRITING || coverModified == coverFile.lastModified()
     }
 
     private fun readMarker(file: File): Marker? = runCatching {
-        val (seriesId, index, checkedAt, coverModified, language) = file.readText().trim().split('|')
-        Marker(seriesId.toLong(), index, checkedAt.toLong(), coverModified.toLong(), language)
+        val parts = file.readText().trim().split('|')
+        val (seriesId, index, checkedAt, coverModified, language) = parts
+        val link = parts.getOrElse(5) { "" }
+        Marker(seriesId.toLong(), index, checkedAt.toLong(), coverModified.toLong(), language, link)
     }.getOrNull()
 
     private fun writeMarker(file: File, m: Marker) {
-        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}")
+        file.writeText("${m.seriesId}|${m.index}|${m.checkedAt}|${m.coverModified}|${m.language}|${m.link}")
     }
 
     private companion object {
+        /** One pass at a time: a library update, the refresh button or a language change. */
+        val passLock = Mutex()
+
         const val API = "https://api.mangabaka.org"
         val VOLUME_LABEL = Regex("""\d+(\.\d+)?""")
 
         const val RECHECK_MS = 24L * 60 * 60 * 1000
+        const val RECHECK_COMPLETED_MS = 7 * RECHECK_MS
+        const val WRITING = -1L
         const val MAX_PAGES = 20
         const val HTTP_NOT_FOUND = 404
         const val HTTP_TOO_MANY_REQUESTS = 429
