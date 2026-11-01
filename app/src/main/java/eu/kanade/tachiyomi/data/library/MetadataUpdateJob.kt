@@ -73,14 +73,15 @@ class MetadataUpdateJob(private val context: Context, workerParams: WorkerParame
                 if (mangaBakaMode == MODE_RESTORE) {
                     mangaBakaCoverUpdater.restoreSourceCovers(mangaToUpdate.map { it.manga }, showProgress)
                 } else {
-                    if (mangaBakaMode == null) updateMetadata()
                     // "Refresh library covers" also checks every MangaBaka cover, ignoring the usual daily wait.
+                    // Done first: refreshing every source takes far longer, and the result shouldn't wait for it.
                     val coverFailures = mangaBakaCoverUpdater.updateAll(
                         mangaList = mangaToUpdate.map { it.manga },
                         force = true,
                         onProgress = showProgress,
                     )
                     notifier.showUpdateErrorNotification(coverFailures)
+                    if (mangaBakaMode == null) updateMetadata()
                 }
                 // KMK <--
                 Result.success()
