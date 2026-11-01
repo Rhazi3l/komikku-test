@@ -29,7 +29,7 @@ jobs:
       - name: Build release APK (no telemetry, no updater)
         run: ./gradlew assembleRelease
 
-      - name: Sign universal APK
+      - name: Sign APKs
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           ALIAS: ${{ secrets.ALIAS }}
@@ -39,15 +39,22 @@ jobs:
           set -e
           echo "$SIGNING_KEY" | base64 -d > "$RUNNER_TEMP/fork.jks"
           APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
-          APK=$(ls app/build/outputs/apk/release/app-universal-release-unsigned.apk)
-          "$APKSIGNER" sign --ks "$RUNNER_TEMP/fork.jks" --ks-key-alias "$ALIAS" \
-            --ks-pass env:KEY_STORE_PASSWORD --key-pass env:KEY_PASSWORD \
-            --out Komikku-mangabaka.apk "$APK"
-          "$APKSIGNER" verify Komikku-mangabaka.apk
+          for abi in arm64-v8a universal; do
+            "$APKSIGNER" sign --ks "$RUNNER_TEMP/fork.jks" --ks-key-alias "$ALIAS" \
+              --ks-pass env:KEY_STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+              --out "Komikku-mangabaka-$abi.apk" "app/build/outputs/apk/release/app-$abi-release-unsigned.apk"
+            "$APKSIGNER" verify "Komikku-mangabaka-$abi.apk"
+          done
           rm -f "$RUNNER_TEMP/fork.jks"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Komikku-mangabaka
-          path: Komikku-mangabaka.apk
+          name: Komikku-mangabaka-arm64
+          path: Komikku-mangabaka-arm64-v8a.apk
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Komikku-mangabaka-universal
+          path: Komikku-mangabaka-universal.apk
           retention-days: 14
